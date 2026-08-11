@@ -401,13 +401,7 @@ export async function getDashboardSummary(req: Request, res: Response) {
         );
         growthProgress.skillsMapped = Number(skillsCount[0].mapped || 0);
       } else {
-        const cvCheck = await query<RowDataPacket[]>(
-          `SELECT id FROM cv_screenings WHERE user_id = ? LIMIT 1`,
-          [authUser.id]
-        );
-        if (cvCheck.length > 0 || readinessScore > 0) {
-          growthProgress.skillsMapped = 3;
-        }
+        growthProgress.skillsMapped = 0;
       }
       
       const projectsCount = await query<RowDataPacket[]>(

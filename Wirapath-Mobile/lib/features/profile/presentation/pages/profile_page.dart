@@ -447,7 +447,7 @@ class _ProfilePageState extends ConsumerState<ProfilePage> {
                 ),
               ),
               const SizedBox(height: 16),
-              if (analytics != null && analytics['categories'] is List && (analytics['categories'] as List).isNotEmpty)
+              if (analytics != null && analytics['has_assessment'] == true && analytics['categories'] is List && (analytics['categories'] as List).isNotEmpty)
                 ...() {
                   final cats = (analytics['categories'] as List).cast<Map<String, dynamic>>();
                   return cats.map((cat) {

@@ -548,17 +548,17 @@ export async function getAssessmentAnalytics(
       const assessScore = hasAssessScore ? assessmentCategoryScores[slug].score : 0;
       const githubScore = getGithubCategoryScore(slug);
 
-      if (hasAssessScore && hasGithubSync) {
+      if (hasAssessment && hasAssessScore && hasGithubSync) {
         // Blend
         score = Math.round((assessScore + githubScore) / 2);
         correct = assessmentCategoryScores[slug].correct;
         total = assessmentCategoryScores[slug].total;
-      } else if (hasAssessScore) {
+      } else if (hasAssessment && hasAssessScore) {
         score = assessScore;
         correct = assessmentCategoryScores[slug].correct;
         total = assessmentCategoryScores[slug].total;
-      } else if (hasGithubSync) {
-        score = githubScore;
+      } else {
+        score = 0;
         correct = 0;
         total = 0;
       }
