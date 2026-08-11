@@ -1,0 +1,831 @@
+import { Request, Response } from "express";
+import { ResultSetHeader, RowDataPacket } from "mysql2";
+import { query } from "../db/connection";
+
+// Count consecutive active days ending today (or yesterday, so the streak
+// isn't broken simply because the user hasn't acted yet today).
+function computeStreakFromDates(dateStrings: string[]): number {
+  if (dateStrings.length === 0) return 0;
+  const days = new Set(dateStrings);
+  const fmt = (dt: Date) => dt.toISOString().slice(0, 10);
+  const cursor = new Date();
+  if (!days.has(fmt(cursor))) {
+    cursor.setDate(cursor.getDate() - 1);
+    if (!days.has(fmt(cursor))) return 0;
+  }
+  let streak = 0;
+  while (days.has(fmt(cursor))) {
+    streak++;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+}
+
+type GoalRow = RowDataPacket & {
+  id: number;
+  name: string;
+};
+
+type UserAccountRow = RowDataPacket & {
+  id: number;
+  email: string;
+  name: string | null;
+};
+
+type SkillRow = RowDataPacket & {
+  id: number;
+  skill_name: string;
+  current_score: number;
+  required_score: number;
+  demand: string;
+  priority: string;
+};
+
+function normalizeString(value: unknown, fallback = "") {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function normalizeGoals(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => normalizeString(item)).filter(Boolean);
+}
+
+function goalToAchievementGoal(goal: string | undefined) {
+  const map: Record<string, string> = {
+    "Get my first job in tech": "GET_FIRST_JOB",
+    "Switch to a developer role": "SWITCH_DEVELOPER_ROLE",
+    "Improve my coding skills": "IMPROVE_CODING_SKILLS",
+    "Prepare for technical interviews": "PREPARE_INTERVIEWS",
+    "Build a strong portfolio": "BUILD_PORTFOLIO",
+    "Understand market demands": "UNDERSTAND_MARKET",
+  };
+
+  return goal ? map[goal] || "UNDERSTAND_MARKET" : "UNDERSTAND_MARKET";
+}
+
+async function getOrCreateUserAccount(email: string, name: string) {
+  const existing = await query<UserAccountRow[]>(
+    "SELECT id, email, name FROM user_accounts WHERE email = ? LIMIT 1",
+    [email],
+  );
+
+  if (existing.length > 0) {
+    await query<ResultSetHeader>(
+      "UPDATE user_accounts SET name = ? WHERE id = ?",
+      [name, existing[0].id],
+    );
+
+    return existing[0].id;
+  }
+
+  const result = await query<ResultSetHeader>(
+    "INSERT INTO user_accounts (email, name) VALUES (?, ?)",
+    [email, name],
+  );
+
+  return result.insertId;
+}
+
+async function syncUsersTable(payload: {
+  email: string;
+  username: string;
+  firstName: string;
+  lastName: string;
+  university: string;
+  fieldOfStudy: string;
+  graduationYear: number | null;
+  achievementGoal: string;
+  cvUrl: string;
+  transcriptUrl: string;
+}) {
+  try {
+    await query<ResultSetHeader>(
+      `INSERT INTO users
+        (email, username, first_name, last_name, university, field_of_study, graduation_year, achievement_goal, cv_url, transcript_url, onboarding_completed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+       ON DUPLICATE KEY UPDATE
+        first_name = VALUES(first_name),
+        last_name = VALUES(last_name),
+        university = VALUES(university),
+        field_of_study = VALUES(field_of_study),
+        graduation_year = VALUES(graduation_year),
+        achievement_goal = VALUES(achievement_goal),
+        cv_url = VALUES(cv_url),
+        transcript_url = VALUES(transcript_url),
+        onboarding_completed = 1,
+        updated_at = CURRENT_TIMESTAMP`,
+      [
+        payload.email,
+        payload.username,
+        payload.firstName,
+        payload.lastName,
+        payload.university,
+        payload.fieldOfStudy,
+        payload.graduationYear,
+        payload.achievementGoal,
+        payload.cvUrl,
+        payload.transcriptUrl,
+      ],
+    );
+  } catch (error) {
+    // users memakai UUID, sedangkan flow MVP web memakai user_accounts.
+    // Kalau sync ke tabel users gagal, onboarding tetap dianggap berhasil selama user_accounts/profiles tersimpan.
+    console.warn("Optional users table sync failed:", error);
+  }
+}
+
+export async function testDb(req: Request, res: Response) {
+  try {
+    const rows = await query<RowDataPacket[]>(
+      "SELECT COUNT(*) AS totalUsers FROM user_accounts",
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Database connected successfully",
+      data: rows[0],
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: "Database connection failed",
+      error: error.message,
+    });
+  }
+}
+
+export async function getOnboarding(req: Request, res: Response) {
+  try {
+    const users = await query<RowDataPacket[]>(
+      `SELECT
+        ua.id,
+        ua.email,
+        ua.name,
+        p.first_name,
+        p.last_name,
+        p.university,
+        p.field_of_study,
+        p.graduation_year
+       FROM user_accounts ua
+       LEFT JOIN profiles p ON p.user_id = ua.id
+       ORDER BY ua.id DESC
+       LIMIT 1`,
+    );
+
+    if (users.length === 0) {
+      res.status(200).json({ success: true, data: null });
+      return;
+    }
+
+    const goals = await query<RowDataPacket[]>(
+      `SELECT g.id, g.name
+       FROM user_goals ug
+       JOIN goals g ON g.id = ug.goal_id
+       WHERE ug.user_id = ?
+       ORDER BY g.id ASC`,
+      [users[0].id],
+    );
+
+    const documents = await query<RowDataPacket[]>(
+      `SELECT document_type, file_name, file_url
+       FROM user_documents
+       WHERE user_id = ?`,
+      [users[0].id],
+    );
+
+    res.status(200).json({
+      success: true,
+      data: {
+        ...users[0],
+        goals,
+        documents,
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to load onboarding data",
+      error: error.message,
+    });
+  }
+}
+
+export async function submitOnboarding(req: Request, res: Response) {
+  try {
+    const firstName = normalizeString(
+      req.body.firstName || req.body.first_name,
+      "Alex",
+    );
+    const lastName = normalizeString(
+      req.body.lastName || req.body.last_name,
+      "Rahman",
+    );
+    const university = normalizeString(
+      req.body.university,
+      "Universitas Contoh",
+    );
+    const fieldOfStudy = normalizeString(
+      req.body.fieldOfStudy || req.body.field_of_study,
+      "Informatika",
+    );
+    const graduationYearRaw = normalizeString(
+      req.body.graduationYear || req.body.graduation_year,
+      "2026",
+    );
+    const graduationYearNumber = Number.parseInt(graduationYearRaw, 10);
+    const graduationYear = Number.isNaN(graduationYearNumber)
+      ? null
+      : graduationYearNumber;
+    const goals = normalizeGoals(req.body.goals);
+    const name = `${firstName} ${lastName}`.trim();
+    const email = normalizeString(
+      req.body.email,
+      `${firstName.toLowerCase()}.${lastName.toLowerCase()}.${Date.now()}@wirapath.local`,
+    ).toLowerCase();
+
+    const cvFileName = normalizeString(
+      req.body.cvFileName || req.body.cv_file_name,
+      "skipped-cv.pdf",
+    );
+    const transcriptFileName = normalizeString(
+      req.body.transcriptFileName || req.body.transcript_file_name,
+      "skipped-transcript.pdf",
+    );
+
+    const userId = await getOrCreateUserAccount(email, name);
+
+    await query<ResultSetHeader>(
+      `INSERT INTO profiles (user_id, first_name, last_name, university, field_of_study, graduation_year)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+        first_name = VALUES(first_name),
+        last_name = VALUES(last_name),
+        university = VALUES(university),
+        field_of_study = VALUES(field_of_study),
+        graduation_year = VALUES(graduation_year),
+        updated_at = CURRENT_TIMESTAMP`,
+      [
+        userId,
+        firstName,
+        lastName,
+        university,
+        fieldOfStudy,
+        graduationYearRaw,
+      ],
+    );
+
+    await query<ResultSetHeader>("DELETE FROM user_goals WHERE user_id = ?", [
+      userId,
+    ]);
+
+    if (goals.length > 0) {
+      const goalRows = await query<GoalRow[]>(
+        `SELECT id, name FROM goals WHERE name IN (${goals.map(() => "?").join(",")})`,
+        goals,
+      );
+
+      for (const goal of goalRows) {
+        await query<ResultSetHeader>(
+          "INSERT IGNORE INTO user_goals (user_id, goal_id) VALUES (?, ?)",
+          [userId, goal.id],
+        );
+      }
+    }
+
+    await query<ResultSetHeader>(
+      `INSERT INTO user_documents (user_id, document_type, file_name, file_url)
+       VALUES (?, 'cv', ?, ?)
+       ON DUPLICATE KEY UPDATE file_name = VALUES(file_name), file_url = VALUES(file_url)`,
+      [userId, cvFileName, `/uploads/${cvFileName}`],
+    );
+
+    await query<ResultSetHeader>(
+      `INSERT INTO user_documents (user_id, document_type, file_name, file_url)
+       VALUES (?, 'transcript', ?, ?)
+       ON DUPLICATE KEY UPDATE file_name = VALUES(file_name), file_url = VALUES(file_url)`,
+      [userId, transcriptFileName, `/uploads/${transcriptFileName}`],
+    );
+
+    await syncUsersTable({
+      email,
+      username: email.split("@")[0],
+      firstName,
+      lastName,
+      university,
+      fieldOfStudy,
+      graduationYear,
+      achievementGoal: goalToAchievementGoal(goals[0]),
+      cvUrl: `/uploads/${cvFileName}`,
+      transcriptUrl: `/uploads/${transcriptFileName}`,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Onboarding saved successfully",
+      data: {
+        userId,
+        email,
+        name,
+        goals,
+      },
+    });
+  } catch (error: any) {
+    console.error("submitOnboarding error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to save onboarding",
+      error: error.message,
+    });
+  }
+}
+
+export async function getDashboardSummary(req: Request, res: Response) {
+  try {
+    const authUser = req.user;
+    let user: { name: string; role: string } = { name: "Career Seeker", role: "Frontend Developer" };
+    let readinessScore = 0;
+    let readinessTrend = "0%";
+    let streak = 0;
+    let growthProgress = {
+      skillsMapped: 0,
+      totalSkills: 3,
+      projectsDone: 0,
+      totalProjects: 3,
+      simulationsDone: 0,
+      totalSimulations: 2,
+    };
+    // Real "Continue Working" items derived from DB activity (empty for new accounts).
+    const activities: Array<{
+      type: "project" | "simulation" | "review";
+      title: string;
+      status: string;
+      progress: number | null;
+      refId: string | null;
+    }> = [];
+
+    if (authUser) {
+      const name =
+        [authUser.first_name, authUser.last_name].filter(Boolean).join(" ") ||
+        "Career Seeker";
+      user = {
+        name: name,
+        role:
+          authUser.target_role ||
+          authUser.field_of_study ||
+          "Frontend Developer",
+      };
+
+      // Pull dynamic readiness score from DB
+      const userDb = await query<RowDataPacket[]>(
+        "SELECT readiness_score FROM users WHERE id = ? LIMIT 1",
+        [authUser.id],
+      );
+      if (userDb.length > 0 && userDb[0].readiness_score !== null) {
+        readinessScore = Math.round(Number(userDb[0].readiness_score));
+      }
+      
+      // Fetch Growth Progress
+      const latestAssessment = await query<RowDataPacket[]>(
+        `SELECT id FROM user_assessments WHERE user_id = ? AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1`,
+        [authUser.id]
+      );
+      if (latestAssessment.length > 0) {
+        const skillsCount = await query<RowDataPacket[]>(
+          `SELECT COUNT(DISTINCT q.category_id) as mapped 
+           FROM user_assessment_answers uaa 
+           JOIN assessment_questions q ON q.id = uaa.question_id 
+           WHERE uaa.assessment_id = ?`,
+           [latestAssessment[0].id]
+        );
+        growthProgress.skillsMapped = Number(skillsCount[0].mapped || 0);
+      } else {
+        const cvCheck = await query<RowDataPacket[]>(
+          `SELECT id FROM cv_screenings WHERE user_id = ? LIMIT 1`,
+          [authUser.id]
+        );
+        if (cvCheck.length > 0 || readinessScore > 0) {
+          growthProgress.skillsMapped = 3;
+        }
+      }
+      
+      const projectsCount = await query<RowDataPacket[]>(
+        `SELECT COUNT(*) as done FROM user_mini_project_submissions WHERE user_id = ? AND status = 'reviewed'`,
+        [authUser.id]
+      );
+      growthProgress.projectsDone = Number(projectsCount[0].done || 0);
+
+      const totalProjectsDb = await query<RowDataPacket[]>(
+        `SELECT COUNT(*) as total 
+         FROM mini_projects mp
+         INNER JOIN mini_project_role_mapping mpr ON mp.id = mpr.mini_project_id
+         WHERE mpr.target_role_pattern = ? AND mp.is_active = 1`,
+        [user.role]
+      );
+      growthProgress.totalProjects = Number(totalProjectsDb[0].total || 3);
+
+      const simulationsCount = await query<RowDataPacket[]>(
+        `SELECT COUNT(*) as done FROM simulations WHERE user_id = ? AND status = 'completed'`,
+        [authUser.id]
+      );
+      growthProgress.simulationsDone = Number(simulationsCount[0].done || 0);
+
+      // Real activity streak from timestamped activity across assessments,
+      // CV screenings, and simulations.
+      const activityDays = new Set<string>();
+      const pullDays = async (sql: string) => {
+        try {
+          const rows = await query<RowDataPacket[]>(sql, [authUser.id]);
+          for (const r of rows) {
+            if (r.d) activityDays.add(String(r.d));
+          }
+        } catch {
+          // Source table may be absent — ignore.
+        }
+      };
+      await pullDays(
+        `SELECT DISTINCT DATE_FORMAT(completed_at, '%Y-%m-%d') AS d FROM user_assessments WHERE user_id = ? AND completed_at IS NOT NULL`,
+      );
+      await pullDays(
+        `SELECT DISTINCT DATE_FORMAT(created_at, '%Y-%m-%d') AS d FROM cv_screenings WHERE user_id = ?`,
+      );
+      await pullDays(
+        `SELECT DISTINCT DATE_FORMAT(created_at, '%Y-%m-%d') AS d FROM simulations WHERE user_id = ?`,
+      );
+      streak = computeStreakFromDates(Array.from(activityDays));
+
+      // Continue Working: in-progress/submitted mini projects
+      const activeProjects = await query<RowDataPacket[]>(
+        `SELECT s.mini_project_id AS refId, mp.title, s.status
+         FROM user_mini_project_submissions s
+         JOIN mini_projects mp ON mp.id = s.mini_project_id
+         WHERE s.user_id = ? AND s.status IN ('in_progress','submitted')
+         ORDER BY s.created_at DESC LIMIT 3`,
+        [authUser.id]
+      );
+      for (const p of activeProjects) {
+        activities.push({
+          type: "project",
+          title: p.title,
+          status: p.status === "submitted" ? "Submitted — awaiting review" : "In Progress",
+          progress: p.status === "submitted" ? 90 : 50,
+          refId: String(p.refId),
+        });
+      }
+
+      // Continue Working: ongoing simulations
+      const ongoingSims = await query<RowDataPacket[]>(
+        `SELECT id, type, company_name FROM simulations
+         WHERE user_id = ? AND status = 'ongoing'
+         ORDER BY created_at DESC LIMIT 2`,
+        [authUser.id]
+      );
+      for (const s of ongoingSims) {
+        activities.push({
+          type: "simulation",
+          title: s.company_name ? `Interview at ${s.company_name}` : "Career Simulation",
+          status: s.type === "salary" ? "Salary Simulation" : "Recruiter Simulation",
+          progress: null,
+          refId: String(s.id),
+        });
+      }
+
+      // Continue Working: latest reviewed project score
+      const lastReview = await query<RowDataPacket[]>(
+        `SELECT mini_project_id AS refId, overall_score FROM user_mini_project_submissions
+         WHERE user_id = ? AND status = 'reviewed' AND overall_score IS NOT NULL
+         ORDER BY reviewed_at DESC LIMIT 1`,
+        [authUser.id]
+      );
+      if (lastReview.length > 0) {
+        activities.push({
+          type: "review",
+          title: "AI Code Review",
+          status: `Last review: ${lastReview[0].overall_score}/100`,
+          progress: null,
+          refId: String(lastReview[0].refId),
+        });
+      }
+
+      // Calculate real weekly trend from last 2 completed assessments
+      const trendRows = await query<RowDataPacket[]>(
+        `SELECT score_percentage, completed_at FROM user_assessments
+         WHERE user_id = ? AND completed_at IS NOT NULL
+         ORDER BY completed_at DESC LIMIT 2`,
+        [authUser.id]
+      );
+      if (trendRows.length >= 2) {
+        const diff = Math.round(Number(trendRows[0].score_percentage) - Number(trendRows[1].score_percentage));
+        readinessTrend = diff > 0 ? `+${diff}%` : diff < 0 ? `${diff}%` : "0%";
+      } else if (trendRows.length === 1) {
+        // First assessment ever — no comparison yet
+        readinessTrend = "0%";
+      }
+
+    } else {
+      user = {
+        name: "Ubay Dillah",
+        role: "Frontend Developer",
+      };
+    }
+
+    const initials = user.name
+      ? user.name
+          .split(" ")
+          .map((n: string) => n[0])
+          .join("")
+          .substring(0, 2)
+          .toUpperCase()
+      : "UD";
+
+    res.status(200).json({
+      message: "Dashboard summary retrieved successfully",
+      result: {
+        name: user.name,
+        role: user.role,
+        initials: initials,
+        streak: streak,
+        readinessScore: readinessScore,
+        readinessTrend,
+        growthProgress,
+        activities,
+      },
+    });
+  } catch (error) {
+    const err = error as Error;
+    res.status(500).json({
+      success: false,
+      message: "Failed to load dashboard summary",
+      error: err.message,
+    });
+  }
+}
+
+export async function getSkillGap(req: Request, res: Response) {
+  try {
+    const user = req.user;
+    if (!user) {
+      res.status(401).json({ success: false, message: "Unauthorized" });
+      return;
+    }
+
+    const latest = await query<RowDataPacket[]>(
+      `SELECT id FROM user_assessments 
+       WHERE user_id = ? AND completed_at IS NOT NULL
+       ORDER BY completed_at DESC LIMIT 1`,
+      [user.id],
+    );
+
+    const role = user.target_role || "Frontend Developer";
+
+    if (latest.length === 0) {
+      res.status(200).json({
+        message: "No assessment found",
+        result: [],
+      });
+      return;
+    }
+
+    const assessmentId = latest[0].id;
+
+    let categoryResults = await query<RowDataPacket[]>(
+      `SELECT 
+         c.slug,
+         c.name,
+         COUNT(uaa.id) as total,
+         SUM(CASE WHEN uaa.is_correct = 1 THEN 1 ELSE 0 END) as correct
+       FROM role_category_mapping m
+       JOIN assessment_categories c ON c.slug = m.category_slug
+       JOIN assessment_questions q ON q.category_id = c.id
+       JOIN user_assessment_answers uaa ON uaa.question_id = q.id
+       WHERE uaa.assessment_id = ? AND m.target_role_pattern = ?
+       GROUP BY c.id
+       ORDER BY m.priority ASC`,
+      [assessmentId, role],
+    );
+
+    if (categoryResults.length === 0) {
+      categoryResults = await query<RowDataPacket[]>(
+        `SELECT c.slug, c.name, 0 as total, 0 as correct
+         FROM role_category_mapping m
+         JOIN assessment_categories c ON c.slug = m.category_slug
+         WHERE m.target_role_pattern = ?
+         ORDER BY m.priority ASC`,
+        [role],
+      );
+    }
+
+    const REQUIRED_SCORES: Record<string, number> = {
+      frontend: 75,
+      backend: 75,
+      data_science: 70,
+      general_cs: 65,
+      soft_skills: 60,
+      other: 55,
+      devops: 65,
+      security: 70,
+      mobile: 65,
+      database: 70,
+    };
+
+    const DEMAND_LEVELS: Record<string, string> = {
+      frontend: "High",
+      backend: "High",
+      data_science: "High",
+      general_cs: "Medium",
+      soft_skills: "Medium",
+      other: "Low",
+      devops: "High",
+      security: "High",
+      mobile: "Medium",
+      database: "High",
+    };
+
+    const result = categoryResults.map((r) => {
+      const total = Number(r.total);
+      const correct = Number(r.correct || 0);
+      const current = total > 0 ? Math.round((correct / total) * 100) : 0;
+      const required = REQUIRED_SCORES[r.slug] || 60;
+      const gap = required - current;
+
+      let priority = "Low";
+      if (gap > 10) priority = "Critical";
+      else if (gap > 0) priority = "High";
+      else if (gap > -10) priority = "Medium";
+
+      return {
+        skill: r.name,
+        current,
+        required,
+        demand: DEMAND_LEVELS[r.slug] || "Medium",
+        priority,
+      };
+    });
+
+    res.status(200).json({
+      message: "Skill gap retrieved successfully",
+      result,
+    });
+  } catch (error) {
+    const err = error as Error;
+    res.status(500).json({
+      success: false,
+      message: "Failed to load skill gap",
+      error: err.message,
+    });
+  }
+}
+
+// Top-10 in-demand skills / languages / tech stacks per target role.
+// Used by the readiness "Market Demand" view so the list reflects exactly the
+// role the user chose during onboarding.
+const MARKET_DEMAND_BY_ROLE: Record<string, string[]> = {
+  "Frontend Developer": [
+    "JavaScript / TypeScript",
+    "React / Next.js",
+    "HTML5 & CSS3",
+    "Responsive UI (Tailwind CSS)",
+    "State Management (Redux / Zustand)",
+    "REST & GraphQL APIs",
+    "Testing (Jest / React Testing Library)",
+    "Web Performance Optimization",
+    "Accessibility (WCAG)",
+    "Git & CI/CD",
+  ],
+  "Backend Developer": [
+    "Node.js / Go / Python",
+    "SQL Database Design",
+    "NoSQL (MongoDB / Redis)",
+    "REST & GraphQL API Design",
+    "Authentication & Security",
+    "System Design & Caching",
+    "Docker & Kubernetes",
+    "CI/CD Pipelines",
+    "Message Queues (Kafka / RabbitMQ)",
+    "Cloud (AWS / GCP)",
+  ],
+  "Data Scientist": [
+    "Python",
+    "SQL & Data Warehousing",
+    "Machine Learning",
+    "Statistics & Probability",
+    "Pandas / NumPy",
+    "Data Visualization",
+    "Deep Learning (TensorFlow / PyTorch)",
+    "Data Pipelines & ETL",
+    "Big Data (Spark)",
+    "MLOps & Model Deployment",
+  ],
+  "UI/UX Designer": [
+    "Figma & Prototyping",
+    "User Research & Personas",
+    "Wireframing",
+    "Design Systems",
+    "Interaction Design",
+    "Usability Testing",
+    "Visual & Typography",
+    "Accessibility (WCAG)",
+    "HTML / CSS Basics",
+    "Information Architecture",
+  ],
+  "Mobile Developer": [
+    "Flutter & Dart Fundamentals",
+    "Mobile State Management (Riverpod / BLoC)",
+    "Go Router & Declarative Navigation",
+    "REST API Integration & JSON Parsing",
+    "Local Storage & Caching (SQLite / Hive)",
+    "Native Device APIs (Camera, Location, Push Alerts)",
+    "Responsive Mobile Layouts & Material Design",
+    "App Lifecycle & Background Services",
+    "Mobile App Performance & Memory Profiling",
+    "App Store & Play Store Deployment",
+  ],
+  "Fullstack Developer": [
+    "React / Next.js Frontend",
+    "Node.js & Express REST APIs",
+    "SQL & Relational Schema Design",
+    "TypeScript Fullstack Development",
+    "Authentication & JWT Stateless Auth",
+    "ORM Query Builders (Prisma / Drizzle)",
+    "State Management & Async Data Fetching",
+    "API Security & Middleware Pipelines",
+    "Git & CI/CD Deployment",
+    "Server-Side Rendering (SSR) & Performance",
+  ],
+  Freelance: [
+    "Full-Stack Web Development (React + Node.js)",
+    "Client Communication & Proposals",
+    "Git & Version Control",
+    "REST API Integration",
+    "Responsive UI (HTML / CSS / Tailwind)",
+    "Database Design (SQL / NoSQL)",
+    "Project & Time Management",
+    "Deployment & Payments (Vercel / Stripe)",
+    "SEO & Web Performance",
+    "Personal Branding & Portfolio",
+  ],
+};
+
+const MARKET_DEMAND_DEFAULT: string[] = [
+  "Full-Stack Web Development",
+  "Problem Solving & Algorithms",
+  "Git & Version Control",
+  "REST API Integration & Databases",
+  "Responsive UI (HTML / CSS)",
+  "Cloud & DevOps Basics",
+  "Testing & Debugging",
+  "Project Management & Agile",
+  "Communication & Collaboration",
+  "Continuous Learning",
+];
+
+export async function getMarketDemand(req: Request, res: Response) {
+  try {
+    const user = req.user;
+    const rawRole = user?.target_role || "Frontend Developer";
+    const roleLower = rawRole.toLowerCase();
+
+    let skills: string[] = MARKET_DEMAND_DEFAULT;
+    if (roleLower.includes("mobile") || roleLower.includes("flutter") || roleLower.includes("android") || roleLower.includes("ios")) {
+      skills = MARKET_DEMAND_BY_ROLE["Mobile Developer"];
+    } else if (roleLower.includes("fullstack") || roleLower.includes("full stack") || roleLower.includes("full-stack")) {
+      skills = MARKET_DEMAND_BY_ROLE["Fullstack Developer"];
+    } else if (roleLower.includes("backend") || roleLower.includes("back end") || roleLower.includes("server") || roleLower.includes("api")) {
+      skills = MARKET_DEMAND_BY_ROLE["Backend Developer"];
+    } else if (roleLower.includes("frontend") || roleLower.includes("front end") || roleLower.includes("react") || roleLower.includes("web")) {
+      skills = MARKET_DEMAND_BY_ROLE["Frontend Developer"];
+    } else if (roleLower.includes("ui") || roleLower.includes("ux") || roleLower.includes("figma") || roleLower.includes("design")) {
+      skills = MARKET_DEMAND_BY_ROLE["UI/UX Designer"];
+    } else if (roleLower.includes("data") || roleLower.includes("python") || roleLower.includes("ml")) {
+      skills = MARKET_DEMAND_BY_ROLE["Data Scientist"];
+    } else if (MARKET_DEMAND_BY_ROLE[rawRole]) {
+      skills = MARKET_DEMAND_BY_ROLE[rawRole];
+    }
+
+    // Build a ranked top-10 list with descending demand metrics so the bars
+    // step down naturally. Job counts/trend are illustrative estimates.
+    const demandData = skills.slice(0, 10).map((skill, idx) => {
+      const trend = 97 - idx * 4; // 97, 93, 89, ...
+      return {
+        rank: idx + 1,
+        skill,
+        jobs_count: Math.round((22000 - idx * 1800) / 100) * 100,
+        trend_score: trend,
+        bar_width: trend,
+      };
+    });
+
+    res.status(200).json({
+      message: "Top industry skills retrieved successfully",
+      result: demandData,
+    });
+  } catch (error) {
+    const err = error as Error;
+    res.status(500).json({
+      success: false,
+      message: "Failed to load market demand",
+      error: err.message,
+    });
+  }
+}

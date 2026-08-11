@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in with Google - Wirapath</title>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            flex-direction: column;
+        }
+        .container {
+            background-color: #161b22;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            text-align: center;
+            max-width: 400px;
+            width: 90%;
+            border: 1px solid #30363d;
+        }
+        h1 {
+            color: #ffffff;
+            font-size: 24px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        p {
+            color: #8b949e;
+            font-size: 14px;
+            margin-bottom: 24px;
+            line-height: 1.5;
+        }
+        #g_id_onload {
+            display: none;
+        }
+        .error-message {
+            color: #ff7b72;
+            background-color: rgba(255, 123, 114, 0.1);
+            padding: 12px;
+            border-radius: 6px;
+            margin-top: 16px;
+            font-size: 14px;
+            display: none;
+            border: 1px solid rgba(255, 123, 114, 0.4);
+        }
+        .loading {
+            display: none;
+            margin-top: 20px;
+            color: #58a6ff;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Sign in to Wirapath</h1>
+    <p>Use your Google account to log in or create a new account.</p>
+
+    <!-- Google Identity Services -->
+    <div id="g_id_onload"
+         data-client_id="{{clientId}}"
+         data-context="signin"
+         data-ux_mode="popup"
+         data-callback="handleCredentialResponse"
+         data-auto_prompt="true">
+    </div>
+
+    <div class="g_id_signin"
+         data-type="standard"
+         data-shape="rectangular"
+         data-theme="filled_black"
+         data-text="signin_with"
+         data-size="large"
+         data-logo_alignment="left">
+    </div>
+
+    <div id="loading" class="loading">Authenticating... Please wait.</div>
+    <div id="error-message" class="error-message"></div>
+</div>
+
+<script>
+    function showError(message) {
+        const errDiv = document.getElementById('error-message');
+        errDiv.textContent = message;
+        errDiv.style.display = 'block';
+        document.getElementById('loading').style.display = 'none';
+    }
+
+    async function handleCredentialResponse(response) {
+        document.getElementById('loading').style.display = 'block';
+        document.getElementById('error-message').style.display = 'none';
+
+        const idToken = response.credential;
+        const redirectUri = "{{redirectUri}}";
+        const isSignUp = {{isSignUp}};
+
+        try {
+            const apiRes = await fetch('/api/auth/google', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    idToken: idToken,
+                    isSignUp: isSignUp
+                })
+            });
+
+            const data = await apiRes.json();
+
+            if (!apiRes.ok) {
+                throw new Error(data.message || 'Authentication failed');
+            }
+
+            const accessToken = data.result.tokens.accessToken;
+            const refreshToken = data.result.tokens.refreshToken;
+
+            if (redirectUri) {
+                // If it's a hash route (Flutter web)
+                if (redirectUri.includes('#/')) {
+                    const separator = redirectUri.includes('?') ? '&' : '?';
+                    window.location.href = `${redirectUri}${separator}access_token=${accessToken}&refresh_token=${refreshToken}`;
+                } else {
+                    // It's a deep link (Flutter mobile)
+                    window.location.href = `${redirectUri}?access_token=${accessToken}&refresh_token=${refreshToken}`;
+                }
+            } else {
+                showError('Login successful, but no redirect URI was provided.');
+            }
+        } catch (error) {
+            showError(error.message);
+        }
+    }
+</script>
+
+</body>
+</html>
